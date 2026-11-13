@@ -1929,6 +1929,32 @@ void tex_ensure_current(Texture* t, Frame& f) {
         g->uploaded = true;
         return;
     }
+    // Per-frame upload budget ([nvn] tex_upload_budget_ms, default 0 = off: a load waits and the textures do not pop in later). A map load made one frame upload 2.2 GB (a 4.7 s frame: 3.5 s of it
+    // uploads and transcodes on this thread). Once the uploads of this present have used the budget, the rest wait for the next present(s):
+    // a texture never uploaded is cleared meanwhile (it draws blank, as a stand-in) and, like one the CPU rewrote, stays dirty, so the next
+    // present tries it again. The first upload of every present always goes ahead, so the queue always moves.
+    static const double budget_ns = nxrt::config_get_double("nvn", "tex_upload_budget_ms", 0.0) * 1e6;
+    static uint32_t budget_present = ~0u;
+    static uint64_t spent_ns = 0;
+    if (budget_ns > 0) {
+        if (budget_present != now) {
+            budget_present = now;
+            spent_ns = 0;
+        }
+        if (spent_ns >= static_cast<uint64_t>(budget_ns)) {
+            if (!g->uploaded) {
+                fill_zero(f, *g);
+                g->uploaded = true;
+            }
+            t->cpu_dirty.store(true);
+            counters().texture_uploads_deferred.fetch_add(1);
+            return;
+        }
+    }
+    struct BudgetSpend {
+        uint64_t t0 = ft::now_ns();
+        ~BudgetSpend() { spent_ns += ft::now_ns() - t0; }
+    } budget_spend;
     t->cpu_dirty.exchange(false);
     // before the storage is read: a write from now on makes it dirty again. Off the render thread (tex_ww_arm_later): the content hash of what
     // the upload reads is taken here instead, and the worker compares it after arming.
