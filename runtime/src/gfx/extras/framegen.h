@@ -30,6 +30,7 @@ uint64_t framegen_take_sleep_ns();   // time spent in the Reflex sleep (DLSS-G) 
 // gameplay), generation pauses instead and the game keeps its rate. Returns the rate for the limiter.
 double framegen_pace(double game_fps, bool fifo, float refresh_hz);
 bool framegen_vsync_paused();   // generation is paused by that rule (F1 page)
+bool framegen_generating();  // DLSS-G is generating frames now (render thread): on, not paused and not shed for video memory
 
 // The Streamline frame token for DLSS SR's constants (viewport 0). Without frame_gen: a new token per call, as before. With it: the frame
 // the render thread is building (its index advances at each present; a second evaluation before the present takes the next index, since
@@ -65,5 +66,14 @@ float framegen_shown_ratio();
 
 // sl.interposer.dll's export `name` (temporal_dlss.cpp); null when Streamline was not started.
 void* streamline_proc(const char* name);
+
+// Whether a Streamline call did its work (temporal_dlss.cpp). `result` is its sl::Result: eOk, or eWarnOutOfVRAM, which Streamline returns in
+// place of eOk when the call succeeded and the card's video memory budget is used up (a warning, logged here at most once per 30 s with
+// `what`, the call's name). Anything else is a failure.
+// The warning is a signal to shed memory, in this order: frame generation goes off and is tried again after a cooldown (framegen.cpp);
+// DLSS itself gives way to the built-in upscaler only when the warning goes on with generation off and the driver refuses allocations
+// (Dlss::evaluate).
+bool streamline_ok(int result, const char* what);
+uint64_t streamline_vram_warned_ms();   // GetTickCount64 at the last eWarnOutOfVRAM streamline_ok saw; 0: none yet
 
 }  // namespace nxrt::extras

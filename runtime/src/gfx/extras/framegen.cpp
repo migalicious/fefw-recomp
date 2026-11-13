@@ -81,6 +81,10 @@ struct State {
     bool inputs = false;                // this frame's depth and motion were tagged
     int streak = 0;
     bool on = false;
+    // eWarnOutOfVRAM (shed): generation is off until shed_until_ms; each shed doubles the wait (30 s to 5 min) until it stayed on for five
+    // minutes; shed_warn_ms is the warning that was answered
+    uint64_t shed_until_ms = 0, shed_warn_ms = 0, on_since_ms = 0;
+    uint32_t sheds = 0;
     int32_t rect[4] = {};
     VkExtent2D bb = {};
     Pair pair[2];
@@ -149,7 +153,7 @@ bool base_init() {
         ro.mode = sl::ReflexMode::eLowLatency;
         ro.frameLimitUs = 0;   // the runtime's limiter paces the game
         const sl::Result r = s.f.reflex_set(ro);
-        s.markers = r == sl::Result::eOk;
+        s.markers = streamline_ok(static_cast<int>(r), "slReflexSetOptions");
         if (!s.markers) NXLOG_W(kTag, "slReflexSetOptions failed (%d): frame generation off", static_cast<int>(r));
         else NXLOG_I(kTag, "Reflex on (low latency), PCL markers from the render thread");
     }
@@ -192,7 +196,7 @@ bool fg_init(State& s, gfx::Device* dev) {
     }
     if (!feature_fn(s, sl::kFeatureDLSS_G, "slDLSSGSetOptions", s.f.fg_set) || !feature_fn(s, sl::kFeatureDLSS_G, "slDLSSGGetState", s.f.fg_get)) return false;
     sl::DLSSGState gs;
-    if (s.f.fg_get(sl::ViewportHandle(0u), gs, nullptr) != sl::Result::eOk) {
+    if (!streamline_ok(static_cast<int>(s.f.fg_get(sl::ViewportHandle(0u), gs, nullptr)), "slDLSSGGetState")) {
         NXLOG_W(kTag, "DLSS-G state unavailable: frame generation off");
         return false;
     }
@@ -335,15 +339,33 @@ Pair* copy_inputs(State& s, VkCommandBuffer cb, const FramegenInputs& in) {
     return &p;
 }
 
-void set_mode(State& s, bool on) {
+void set_mode(State& s, bool on, bool release = false);
+
+// The video memory budget is used up: generation goes off and gives its resources back, and is tried again after a cooldown.
+void shed(State& s, const char* why) {
+    const uint64_t cool = std::min<uint64_t>(30000ull << std::min<uint32_t>(s.sheds, 4u), 300000ull);
+    ++s.sheds;
+    s.shed_until_ms = GetTickCount64() + cool;
+    s.shed_warn_ms = streamline_vram_warned_ms();
+    NXLOG_W(kTag, "%s: frame generation off to free video memory, tried again in %llu s", why, static_cast<unsigned long long>(cool / 1000));
+    set_mode(s, false, true);
+    s.streak = 0;
+}
+
+// release: off without eRetainResourcesWhenOff, so DLSS-G frees what it holds (shed).
+void set_mode(State& s, bool on, bool release) {
     sl::DLSSGOptions o;
     o.mode = on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
     o.numFramesToGenerate = 1;
-    o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+    o.flags = release ? static_cast<sl::DLSSGFlags>(0) : sl::DLSSGFlags::eRetainResourcesWhenOff;
     o.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
     o.onErrorCallback = &on_api_error;
     const sl::Result r = s.f.fg_set(sl::ViewportHandle(0u), o);
-    if (r != sl::Result::eOk) {
+    if (on && r == sl::Result::eWarnOutOfVRAM) {   // no room to turn it on: back off instead of generating into the shortage
+        shed(s, "slDLSSGSetOptions reports the video memory budget used up");
+        return;
+    }
+    if (!streamline_ok(static_cast<int>(r), "slDLSSGSetOptions")) {   // turning it off under eWarnOutOfVRAM is not a failure
         NXLOG_E(kTag, "slDLSSGSetOptions failed (%d): frame generation off", static_cast<int>(r));
         s.fg = false;
         s.on = false;
@@ -351,6 +373,7 @@ void set_mode(State& s, bool on) {
         return;
     }
     if (on != s.on) NXLOG_I(kTag, "frame generation %s at frame %u", on ? "on" : "off", s.index);
+    if (on && !s.on) s.on_since_ms = GetTickCount64();
     s.on = on;
 }
 
@@ -424,6 +447,7 @@ bool framegen_support_override(int sl_result) {
     return any_gpu && (r == sl::Result::eErrorAdapterNotSupported || r == sl::Result::eErrorFeatureNotSupported);
 }
 bool framegen_running() { return fg_setting() == 3 ? ffx_fg_present_count() > 0 || st().fg : st().fg; }
+bool framegen_generating() { return fg_setting() == 1 && st().fg && st().on; }
 
 void* sl_frame_token() {
     if (!temporal_dlss_started() || !base_init()) return nullptr;
@@ -598,8 +622,15 @@ void framegen_present_begin(VkCommandBuffer cb, VkExtent2D backbuffer, VkExtent2
     if (s.fg) {
         int32_t rect[4];
         picture_rect(backbuffer, src, crop, keep_aspect, rect);
-        const bool small = backbuffer.width < s.min_dimension || backbuffer.height < s.min_dimension;
-        const bool want = s.inputs && !again && fg_setting() == 1 && !s.vsync_paused && !small;
+        // Streamline's eWarnOutOfVRAM (from DLSS's evaluation, or from here): generation is the largest optional consumer, so it is shed
+        // first. After the cooldown it is tried again, but not while the warnings are still coming (looked at again every 10 s).
+        const uint64_t now_ms = GetTickCount64(), warned_ms = streamline_vram_warned_ms();
+        if (s.on && warned_ms && warned_ms != s.shed_warn_ms && now_ms - warned_ms < 1000) shed(s, "Streamline reports the video memory budget used up");
+        if (s.on && s.sheds && now_ms - s.on_since_ms > 300000) s.sheds = 0;
+        if (!s.on && s.sheds && now_ms >= s.shed_until_ms && warned_ms && now_ms - warned_ms < 2000) s.shed_until_ms = now_ms + 10000;
+                const bool small = backbuffer.width < s.min_dimension || backbuffer.height < s.min_dimension;
+        const bool shedding = now_ms < s.shed_until_ms;
+        const bool want = s.inputs && !again && fg_setting() == 1 && !s.vsync_paused && !small && !shedding;
         // Reporting only: a game in the background stops presenting new frames, and the page says which of the two it was.
         const bool unfocused = !platform::focused();
         s.pause_reason = want ? render_status::Pause::None

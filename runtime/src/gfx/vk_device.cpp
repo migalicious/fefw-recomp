@@ -53,6 +53,7 @@ VKAPI_ATTR VkResult VKAPI_CALL counted_allocate_memory(VkDevice d, const VkMemor
         vk_gauge_memory_bytes().add(static_cast<int64_t>(info->allocationSize));
     } else {
         *out = VK_NULL_HANDLE;
+        vk_gauge_memory_failures().add(1);
         // At most one line a second, with the failures since the last line: under memory pressure VMA retries every allocation and the
         // game streams on, so a failure can repeat thousands of times a second and the log writes alone stalled the render thread.
         static std::atomic<uint64_t> failures{0}, reported{0}, last_ms{0};
@@ -104,6 +105,7 @@ nxrt::GaugeCounter& vk_gauge_query_pools() { static nxrt::GaugeCounter g("vk.que
 nxrt::GaugeCounter& vk_gauge_swapchains() { static nxrt::GaugeCounter g("vk.swapchains"); return g; }
 nxrt::GaugeCounter& vk_gauge_memory_allocs() { static nxrt::GaugeCounter g("vk.memory_allocs"); return g; }
 nxrt::GaugeCounter& vk_gauge_memory_bytes() { static nxrt::GaugeCounter g("vk.memory_bytes"); return g; }
+nxrt::GaugeCounter& vk_gauge_memory_failures() { static nxrt::GaugeCounter g("vk.memory_failures"); return g; }
 
 }  // namespace nxrt
 
