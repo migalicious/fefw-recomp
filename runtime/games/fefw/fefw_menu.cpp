@@ -639,7 +639,7 @@ void upscaler_group(Menu& m) {
     }
     const char* in_use = nvn::be::dlss_upscaler_in_use();
     ImGui::TextDisabled(tr("Running: %s; frame generation %s."), in_use ? in_use : "no DLSS call yet",
-                        extras::framegen_vsync_paused() ? "paused: vsync is on and the display is under twice the game's frame rate"
+                        extras::framegen_vsync_paused() ? "waiting: vsync is on and the display is under twice the game's frame rate (starts when the game drops under 45% of the refresh rate)"
                         : extras::framegen_running()    ? "on"
                         : extras::framegen_requested()  ? "asked for, not running (see the log)"
                                                         : "off");

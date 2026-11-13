@@ -104,6 +104,9 @@ struct State {
     double win_game_fps = 0, win_shown_fps = 0;
     bool win_measured = false;
     uint64_t status_ns = 0;                         // the last publish_status (250 ms throttle)
+    uint64_t pace_t0 = 0;                          // framegen_pace: start of the current measuring window
+    uint32_t pace_n = 0;                            // presents in it
+    double pace_fps = 0;                            // the rate the game actually reached over the last window (0: not known yet)
 };
 State& st() {
     static State s;
@@ -394,16 +397,35 @@ double framegen_pace(double game_fps, bool fifo, float refresh_hz) {
     State& s = st();
     bool paused = false;
     double out = game_fps;
+    // The rate the game really reaches, over half-second windows. The game's target rate alone is not enough: at a 120 fps target on a 165 Hz display
+    // the old rule paused generation for the whole session, even while the game ran at 60 and two frames per game frame would have fitted.
+    {
+        const uint64_t now = FrameLimiter::now_ns();
+        if (!s.pace_t0) s.pace_t0 = now;
+        ++s.pace_n;
+        if (now - s.pace_t0 >= 500000000ull) {
+            s.pace_fps = s.pace_n / (static_cast<double>(now - s.pace_t0) * 1e-9);
+            s.pace_t0 = now;
+            s.pace_n = 0;
+        }
+    }
     if (fifo && refresh_hz > 0 && framegen_running()) {
         const double half = static_cast<double>(refresh_hz) * 0.5 * 0.9995;
-        if (game_fps > 0 && half < game_fps * 0.95) paused = true;
-        else out = game_fps > 0 ? std::min(game_fps, half) : half;
+        if (game_fps > 0 && half < game_fps * 0.95) {
+            // The target does not fit, so generation runs only while the game is slower than that: on when it reaches under 90% of half the refresh
+            // rate, off again above 100% (hysteresis, no flapping). The game's rate is never capped here: its logic follows it.
+            if (s.pace_fps <= 0) paused = true;   // not measured yet: wait
+            else paused = s.vsync_paused ? s.pace_fps > half * 0.90 : s.pace_fps > half;
+        } else {
+            out = game_fps > 0 ? std::min(game_fps, half) : half;
+        }
     }
     if (paused != s.vsync_paused || (fifo && refresh_hz > 0 && game_fps > 0 && !s.pace_told)) {   // the game's rate known: one line
         s.pace_told = s.pace_told || (fifo && refresh_hz > 0 && game_fps > 0);
         if (paused)
-            NXLOG_W(kTag, "frame generation paused: vsync is on and the display's %.0f Hz cannot show two frames for each of the game's %.0f: "
-                          "turn vsync off (or use a display of at least %.0f Hz) to use it", refresh_hz, game_fps, game_fps * 2.0);
+            NXLOG_W(kTag, "frame generation paused: vsync is on and the display's %.0f Hz cannot show two frames for each of the game's %.0f (now %.0f): "
+                          "it turns on by itself when the game drops under %.0f fps; or turn vsync off (or use a display of at least %.0f Hz)",
+                    refresh_hz, game_fps, s.pace_fps, static_cast<double>(refresh_hz) * 0.45, game_fps * 2.0);
         else if (fifo && refresh_hz > 0)
             NXLOG_I(kTag, "frame generation with vsync on a %.0f Hz display: the game renders at most %.2f fps (just under half the refresh rate)",
                     refresh_hz, static_cast<double>(refresh_hz) * 0.5 * 0.9995);
