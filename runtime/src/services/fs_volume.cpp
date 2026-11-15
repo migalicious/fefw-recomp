@@ -151,13 +151,13 @@ private:
 
 // Applies a decided commit. Marker lines: "W <work folder>", "R <committed folder>", then "D rel" (delete), "M rel" (make folder),
 // "F rel" (move file work -> committed). Every step can be repeated, so a commit interrupted here is finished by running it again.
-// Returns the number of steps, -1 when the marker cannot be read. `stop_after` (> 0) stops after that many steps (crash simulation).
+// Returns the number of steps, -1 on any I/O error. `stop_after` (> 0) stops after that many steps (crash simulation).
 int apply_marker(const stdfs::path& marker, int stop_after = 0) {
     std::ifstream in(marker, std::ios::binary);
     if (!in) return -1;
     std::string line;
     stdfs::path work, root;
-    int n = 0;
+    std::vector<std::string> steps;
     std::error_code ec;
     while (std::getline(in, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
@@ -165,32 +165,67 @@ int apply_marker(const stdfs::path& marker, int stop_after = 0) {
         const std::string arg = line.substr(2);
         if (line[0] == 'W') work = u8(arg);
         else if (line[0] == 'R') root = u8(arg);
-        else if (work.empty() || root.empty()) continue;
-        else if (line[0] == 'D') {
+        else if (work.empty() || root.empty()) return -1;
+        else steps.push_back(line);
+    }
+    if (in.bad() || work.empty() || root.empty()) return -1;
+    in.close();
+    int n = 0;
+    // Finish and durably retire ALL deletions before moving any files. Replaying a
+    // directory deletion after some of its replacement files were moved loses data.
+    bool deleted = false;
+    for (const auto& step : steps) {
+        if (step[0] == 'D') {
+            const std::string arg = step.substr(2);
             stdfs::remove_all(root / u8(arg), ec);
+            if (ec) return -1;
+            deleted = true;
             n++;
-        } else if (line[0] == 'M') {
+            if (stop_after > 0 && n >= stop_after) return n;
+        }
+    }
+    if (deleted) {
+        const stdfs::path next = marker.wstring() + L".apply";
+        {
+            std::ofstream out(next, std::ios::binary | std::ios::trunc);
+            out << "W " << to_u8(work) << "\nR " << to_u8(root) << "\n";
+            for (const auto& step : steps) if (step[0] != 'D') out << step << '\n';
+            out.close();
+            if (!out) return -1;
+        }
+        HANDLE h = open_host(next, true, OPEN_EXISTING);
+        if (h == INVALID_HANDLE_VALUE) return -1;
+        const bool flushed = FlushFileBuffers(h) != 0;
+        CloseHandle(h);
+        if (!flushed || !MoveFileExW(next.c_str(), marker.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return -1;
+    }
+    for (const auto& step : steps) {
+        const std::string arg = step.substr(2);
+        if (step[0] == 'M') {
             stdfs::create_directories(root / u8(arg), ec);
+            if (ec) return -1;
             n++;
-        } else if (line[0] == 'F') {
+        } else if (step[0] == 'F') {
             const stdfs::path a = work / u8(arg), b = root / u8(arg);
-            if (stdfs::exists(a, ec)) {
+            const bool source_exists = stdfs::exists(a, ec);
+            if (ec) return -1;
+            if (source_exists) {
                 stdfs::create_directories(b.parent_path(), ec);
+                if (ec) return -1;
                 stdfs::rename(a, b, ec);
                 if (ec) {
                     NXLOG_E("fs", "commit: moving %s failed: %s", arg.c_str(), ec.message().c_str());
                     return -1;
                 }
-            }
+            } else if (!stdfs::is_regular_file(b, ec) || ec) return -1;
             n++;
         } else {
             continue;
         }
         if (stop_after > 0 && n >= stop_after) return n;
     }
-    in.close();
     stdfs::remove(marker, ec);
-    return n;
+    return ec ? -1 : n;
 }
 
 }  // namespace
@@ -377,12 +412,14 @@ Volume::Volume(const std::string& root, bool journal, bool read_only, uint64_t c
     std::error_code ec;
     if (journal) {
         stdfs::create_directories(s.root, ec);
-        recover(root);
         s.marker = stdfs::path(s.root.string() + ".commit");
+        if (ec || !recover(root)) return;
         s.work = stdfs::path(s.root.string() + ".work." + std::to_string(GetCurrentProcessId()));
         s.journal_file = stdfs::path(s.root.string() + ".journal." + std::to_string(GetCurrentProcessId()));
         stdfs::remove_all(s.work, ec);   // a second open in this process starts from the committed state
+        if (ec) return;
         stdfs::create_directories(s.work, ec);
+        if (ec) return;
         s.ok = stdfs::is_directory(s.root, ec) && stdfs::is_directory(s.work, ec);
     } else {
         s.ok = stdfs::is_directory(s.root, ec);
@@ -394,26 +431,31 @@ Volume::Volume(const std::string& root, bool journal, bool read_only, uint64_t c
 }
 
 Volume::~Volume() {
-    if (!p_ || !p_->journal) return;
+    if (!p_ || !p_->journal || p_->work.empty()) return;
     std::error_code ec;
     // A decided commit that was not finished keeps its work folder: the next open rolls it forward. Otherwise the uncommitted
     // changes are dropped, as they are when a save is unmounted on the console without Commit.
-    if (!stdfs::exists(p_->marker, ec)) stdfs::remove_all(p_->work, ec);
+    if (!stdfs::exists(p_->marker, ec) && !ec) stdfs::remove_all(p_->work, ec);
 }
 
 bool Volume::ok() const { return p_->ok; }
 
 void Volume::set_crash_point_for_tests(int point) { g_crash_point = point; }
 
-void Volume::recover(const std::string& root_s) {
+bool Volume::recover(const std::string& root_s) {
     const stdfs::path root = u8(root_s);
     RootLock lock(root_s);
     std::error_code ec;
     const stdfs::path marker(root.string() + ".commit");
     if (stdfs::exists(marker, ec)) {
         const int n = apply_marker(marker);
+        if (n < 0) {
+            NXLOG_E("fs", "save recovery failed for %s: pending data preserved; close other programs using the save and retry", root_s.c_str());
+            return false;
+        }
         NXLOG_W("fs", "a commit of %s was interrupted after it was decided: finished now (%d changes)", root_s.c_str(), n);
     }
+    if (ec) return false;
     // Work folders and journals of processes that no longer run.
     const stdfs::path dir = root.parent_path();
     const std::string stem = root.filename().string();
@@ -429,6 +471,7 @@ void Volume::recover(const std::string& root_s) {
         stdfs::remove_all(it->path(), e2);
         NXLOG_I("fs", "uncommitted %s of process %lu discarded (%s)", is_work ? "work folder" : "journal", static_cast<unsigned long>(pid), name.c_str());
     }
+    return !ec;
 }
 
 uint32_t Volume::create_file(const std::string& path, int64_t size) {
@@ -601,12 +644,16 @@ uint64_t Volume::used_bytes() {
 }
 
 uint32_t Volume::commit() {
+    if (!p_->ok) return rc::kGenericFailure;
     if (!p_->journal) return 0;
     if (read_only_) return 0;
     Impl& s = *p_;
     std::lock_guard<std::mutex> lk(s.mu);
     RootLock lock(to_u8(s.root));
     std::error_code ec;
+    // Never replace an earlier decided journal, including one whose apply failed
+    // in this process. Finish it on recovery rather than lose its change list.
+    if (stdfs::exists(s.marker, ec) || ec) return rc::kGenericFailure;
     if (s.tomb.empty() && !stdfs::exists(s.work, ec)) return 0;
 
     // Phase 1: flush the changed files, write the change list, make it the decided marker with one rename.
@@ -616,34 +663,38 @@ uint32_t Volume::commit() {
     std::vector<std::string> files, dirs;
     for (stdfs::recursive_directory_iterator it(s.work, ec), end; !ec && it != end; it.increment(ec)) {
         const std::string rel = to_u8(stdfs::relative(it->path(), s.work, ec));
+        if (ec) return rc::kGenericFailure;
         std::string g = rel;
         std::replace(g.begin(), g.end(), '\\', '/');
-        if (it->is_directory(ec)) {
+        const bool is_dir = it->is_directory(ec);
+        if (ec) return rc::kGenericFailure;
+        if (is_dir) {
             dirs.push_back(g);
         } else {
             files.push_back(g);
             HANDLE h = CreateFileW(it->path().c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
-            if (h != INVALID_HANDLE_VALUE) {
-                FlushFileBuffers(h);
-                CloseHandle(h);
-            }
+            if (h == INVALID_HANDLE_VALUE) return rc::kGenericFailure;
+            const bool flushed = FlushFileBuffers(h) != 0;
+            CloseHandle(h);
+            if (!flushed) return rc::kGenericFailure;
         }
     }
+    if (ec) return rc::kGenericFailure;
     for (const std::string& d : dirs) body += "M " + d + "\n";
     for (const std::string& f : files) body += "F " + f + "\n";
     changes += static_cast<int>(dirs.size() + files.size());
     {
         std::ofstream j(s.journal_file, std::ios::binary | std::ios::trunc);
         j << body;
-        j.flush();
+        j.close();
         if (!j) return rc::kGenericFailure;
     }
     {
         HANDLE h = CreateFileW(s.journal_file.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (h != INVALID_HANDLE_VALUE) {
-            FlushFileBuffers(h);
-            CloseHandle(h);
-        }
+        if (h == INVALID_HANDLE_VALUE) return rc::kGenericFailure;
+        const bool flushed = FlushFileBuffers(h) != 0;
+        CloseHandle(h);
+        if (!flushed) return rc::kGenericFailure;
     }
     if (!MoveFileExW(s.journal_file.c_str(), s.marker.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return rc::kGenericFailure;
     if (g_crash_point == 1) return rc::kGenericFailure;   // decided, nothing applied
@@ -654,7 +705,9 @@ uint32_t Volume::commit() {
     if (applied < 0) return rc::kGenericFailure;
     s.tomb.clear();
     stdfs::remove_all(s.work, ec);
+    if (ec) return rc::kGenericFailure;
     stdfs::create_directories(s.work, ec);
+    if (ec) return rc::kGenericFailure;
     NXLOG_D("fs", "commit %s: %d changes", to_u8(s.root).c_str(), changes);
     return 0;
 }

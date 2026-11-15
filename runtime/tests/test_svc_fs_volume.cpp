@@ -64,6 +64,102 @@ bool names_are(Volume& v, const std::string& dir, std::initializer_list<const ch
 
 }  // namespace
 
+// Windows sharing failures reproduce the recovery paths without changing real saves.
+namespace {
+struct NoDeleteHandle {
+    HANDLE h;
+    explicit NoDeleteHandle(const stdfs::path& p)
+        : h(CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr)) {}
+    ~NoDeleteHandle() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+};
+}
+
+NXTEST(journal_failed_delete_keeps_marker) {
+    TempDir t("locked_delete");
+    Volume v(t.root("save"), true, false, 0);
+    REQUIRE(put(v, "/f", "old"));
+    REQUIRE(v.commit() == 0);
+    {
+        NoDeleteHandle hold(t.p / "save/f");
+        REQUIRE(hold.h != INVALID_HANDLE_VALUE);
+        CHECK_EQ(v.delete_file("/f"), 0u);
+        CHECK(v.commit() != 0);
+        CHECK(stdfs::exists(t.p / "save.commit"));
+        // A second commit must not replace the pending journal.
+        CHECK(v.commit() != 0);
+    }
+    CHECK(Volume::recover(t.root("save")));
+    CHECK(!stdfs::exists(t.p / "save/f"));
+    CHECK(!stdfs::exists(t.p / "save.commit"));
+}
+
+NXTEST(journal_failed_recovery_preserves_dead_process_data) {
+    TempDir t("failed_recovery");
+    auto root = t.p / "save", work = t.p / "save.work.4294967294";
+    stdfs::create_directories(root);
+    stdfs::create_directories(work);
+    std::ofstream(root / "slot") << "old";
+    std::ofstream(work / "slot") << "new";
+    std::ofstream(t.p / "save.commit") << "W " << work.string() << "\nR " << root.string() << "\nF slot\n";
+    {
+        NoDeleteHandle hold(root / "slot");
+        REQUIRE(hold.h != INVALID_HANDLE_VALUE);
+        CHECK(!Volume::recover(root.string()));
+        CHECK(stdfs::exists(work / "slot"));
+        CHECK(stdfs::exists(t.p / "save.commit"));
+        Volume blocked(root.string(), true, false, 0);
+        CHECK(!blocked.ok());
+        CHECK(blocked.commit() != 0);
+    }
+    CHECK(stdfs::exists(work / "slot"));
+    REQUIRE(Volume::recover(root.string()));
+    Volume v(root.string(), true, false, 0);
+    REQUIRE(v.ok());
+    CHECK_EQ(read_all(v, "/slot"), std::string("new"));
+}
+
+NXTEST(journal_retry_does_not_repeat_completed_directory_deletion) {
+    TempDir t("partial_recovery");
+    auto root = t.p / "save", work = t.p / "save.work.4294967294";
+    stdfs::create_directories(root / "dir");
+    stdfs::create_directories(work / "dir");
+    std::ofstream(root / "dir/old") << "old";
+    std::ofstream(root / "locked") << "old";
+    std::ofstream(work / "dir/new") << "new";
+    std::ofstream(work / "locked") << "updated";
+    std::ofstream(t.p / "save.commit") << "W " << work.string() << "\nR " << root.string()
+        << "\nD dir\nM dir\nF dir/new\nF locked\n";
+    {
+        NoDeleteHandle hold(root / "locked");
+        REQUIRE(hold.h != INVALID_HANDLE_VALUE);
+        CHECK(!Volume::recover(root.string()));
+        CHECK(stdfs::exists(root / "dir/new"));
+        CHECK(!stdfs::exists(work / "dir/new"));
+    }
+    REQUIRE(Volume::recover(root.string()));
+    Volume v(root.string(), true, false, 0);
+    CHECK_EQ(read_all(v, "/dir/new"), std::string("new"));
+    CHECK_EQ(read_all(v, "/locked"), std::string("updated"));
+    CHECK(!stdfs::exists(root / "dir/old"));
+}
+
+NXTEST(journal_cannot_flush_changed_file_leaves_committed_state) {
+    TempDir t("flush_open_failure");
+    Volume v(t.root("save"), true, false, 0);
+    REQUIRE(put(v, "/f", "old"));
+    REQUIRE(v.commit() == 0);
+    REQUIRE(put(v, "/f", "new", false));
+    auto work = stdfs::path(t.root("save") + ".work." + std::to_string(GetCurrentProcessId()));
+    HANDLE h = CreateFileW((work / "f").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(h != INVALID_HANDLE_VALUE);
+    CHECK(v.commit() != 0);
+    CHECK(!stdfs::exists(t.p / "save.commit"));
+    CloseHandle(h);
+    CHECK_EQ(v.commit(), 0u);
+    Volume mounted(t.root("save"), true, false, 0);
+    CHECK_EQ(read_all(mounted, "/f"), std::string("new"));
+}
+
 NXTEST(normalize_paths) {
     std::string out;
     uint32_t err = 0;
