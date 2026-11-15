@@ -4,6 +4,7 @@
 // Config: [gfx] astc_quality (fast / high / uncompressed, default high, fast with the C++ encoder; nvn_texdata.h), [nvn] bc7_quality (env NXRT_NVN_BC7_QUALITY,
 // default 3, 1 with the C++ encoder), [nvn] bc7_cache (env NXRT_NVN_BC7_CACHE, default "bc7_cache" in the current directory, "" disables the cache).
 #include "nvn_texdata.h"
+#include "nvn_texture_hash.h"
 
 #include <algorithm>
 #include <atomic>
@@ -49,58 +50,7 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 // ---- hash -----------------------------------------------------------------------------------------------------------------
 // xxHash64-style mix: four lanes over 32-byte stripes, then a final avalanche. Not byte compatible with xxHash; it only has
 // to be fast and to separate textures. The cache also compares its header, so a collision cannot return wrong data silently.
-constexpr uint64_t kP1 = 0x9E3779B185EBCA87ull, kP2 = 0xC2B2AE3D27D4EB4Full, kP3 = 0x165667B19E3779F9ull,
-                   kP4 = 0x85EBCA77C2B2AE63ull, kP5 = 0x27D4EB2F165667C5ull;
-
-inline uint64_t rotl64(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
-inline uint64_t read64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
-inline uint32_t read32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
-inline uint64_t lane(uint64_t acc, uint64_t in) { acc += in * kP2; acc = rotl64(acc, 31); return acc * kP1; }
-inline uint64_t merge_lane(uint64_t h, uint64_t v) { h ^= lane(0, v); return h * kP1 + kP4; }
-
-uint64_t hash_seeded(const uint8_t* p, size_t n, uint64_t seed) {
-    const uint8_t* const end = p + n;
-    uint64_t h;
-    if (n >= 32) {
-        uint64_t v1 = seed + kP1 + kP2, v2 = seed + kP2, v3 = seed, v4 = seed - kP1;
-        do {
-            v1 = lane(v1, read64(p));
-            v2 = lane(v2, read64(p + 8));
-            v3 = lane(v3, read64(p + 16));
-            v4 = lane(v4, read64(p + 24));
-            p += 32;
-        } while (end - p >= 32);
-        h = rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18);
-        h = merge_lane(h, v1);
-        h = merge_lane(h, v2);
-        h = merge_lane(h, v3);
-        h = merge_lane(h, v4);
-    } else {
-        h = seed + kP5;
-    }
-    h += n;
-    while (end - p >= 8) {
-        h ^= lane(0, read64(p));
-        h = rotl64(h, 27) * kP1 + kP4;
-        p += 8;
-    }
-    if (end - p >= 4) {
-        h ^= static_cast<uint64_t>(read32(p)) * kP1;
-        h = rotl64(h, 23) * kP2 + kP3;
-        p += 4;
-    }
-    while (p < end) {
-        h ^= static_cast<uint64_t>(*p) * kP5;
-        h = rotl64(h, 11) * kP1;
-        ++p;
-    }
-    h ^= h >> 33;
-    h *= kP2;
-    h ^= h >> 29;
-    h *= kP3;
-    h ^= h >> 32;
-    return h;
-}
+using texture_hash::hash_seeded;
 
 // ---- little-endian helpers for the cache file ------------------------------------------------------------------------------
 void put32(std::vector<uint8_t>& v, uint32_t x) {
@@ -393,7 +343,7 @@ uint64_t hash_bytes(const void* data, size_t size) {
 namespace {
 
 // The cache key of a texture: the hash of the source bytes, seeded with what else decides the output (format, size, layout, quality).
-uint64_t cache_key_of(uint64_t storage_size, const uint8_t* mem, const TexLayout& L, const std::vector<LevelGeom>& geo, const FormatInfo& fmt, int quality) {
+uint64_t cache_seed_of(const TexLayout& L, const std::vector<LevelGeom>& geo, const FormatInfo& fmt, int quality) {
     const LevelGeom& g0 = geo[0];
     const uint64_t block_height = L.block_linear ? L.layout.levels[0].gob_blocks_y : 0;
     const std::vector<uint64_t> meta = {kCacheVersion,
@@ -406,8 +356,25 @@ uint64_t cache_key_of(uint64_t storage_size, const uint8_t* mem, const TexLayout
                                         block_height,
                                         L.pitch,
                                         static_cast<uint64_t>(quality)};
-    const uint64_t meta_hash = hash_bytes(meta.data(), meta.size() * sizeof(uint64_t));
-    return hash_seeded(mem, static_cast<size_t>(storage_size), meta_hash);
+    return hash_bytes(meta.data(), meta.size() * sizeof(uint64_t));
+}
+
+uint64_t cache_key_of(uint64_t storage_size, const uint8_t* mem, const TexLayout& L, const std::vector<LevelGeom>& geo, const FormatInfo& fmt, int quality) {
+    return hash_seeded(mem, static_cast<size_t>(storage_size), cache_seed_of(L, geo, fmt, quality));
+}
+
+bool batch_hash_enabled() {
+    static const bool batch = config_get_bool("nvn", "tex_hash_batch", false);
+    return batch;
+}
+
+std::array<uint64_t, 2> cache_quality_keys(uint64_t bytes, const uint8_t* mem, const TexLayout& L, const std::vector<LevelGeom>& geo,
+                                         const FormatInfo& fmt, const int* quality, int count) {
+    // Opt in for comparisons: a high-quality cache hit otherwise needs only one
+    // seed, while a cold lookup of high + fast can share its source-byte loads.
+    if (count == 2 && batch_hash_enabled())
+        return texture_hash::hash_pair(mem, static_cast<size_t>(bytes), {cache_seed_of(L, geo, fmt, quality[0]), cache_seed_of(L, geo, fmt, quality[1])});
+    return {0, 0};
 }
 
 // The VkFormat a cache file declares (magic, version and key checked), VK_FORMAT_UNDEFINED when there is no valid file.
@@ -573,8 +540,10 @@ VkFormat cache_entry_format(const Texture& t, bool bc1) {
     if (!cache_dir().empty()) {
         int q[2];
         const int n = entry_qualities(am, q);
+        const auto keys = cache_quality_keys(t.storage_size, t.mem, L, geo, *L.fmt, q, n);
+        const bool batched = n == 2 && batch_hash_enabled();
         for (int i = 0; i < n; ++i) {
-            const uint64_t key = cache_key_of(t.storage_size, t.mem, L, geo, *L.fmt, q[i]);
+            const uint64_t key = batched ? keys[i] : cache_key_of(t.storage_size, t.mem, L, geo, *L.fmt, q[i]);
             const VkFormat f = cache_peek_format(bc7_cache_path(t, key), key);
             if (f == VK_FORMAT_UNDEFINED) continue;
             if (f == rgba || (f == VK_FORMAT_BC5_UNORM_BLOCK && !L.fmt->srgb)) return f;   // the first valid entry decides
@@ -644,8 +613,10 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
             const int nq = entry_qualities(aq, q);
             struct Cand { uint64_t key; std::string path; VkFormat ef; } cand[2];
             int chosen = -1, filled = 0;
+            const auto keys = cache_quality_keys(t.storage_size, src_mem, L, geo, fmt, q, nq);
+            const bool batched = nq == 2 && batch_hash_enabled();
             for (int i = 0; i < nq && chosen < 0; ++i) {
-                cand[i].key = cache_key_of(t.storage_size, src_mem, L, geo, fmt, q[i]);
+                cand[i].key = batched ? keys[i] : cache_key_of(t.storage_size, src_mem, L, geo, fmt, q[i]);
                 cand[i].path = bc7_cache_path(t, cand[i].key);
                 cand[i].ef = cache_peek_format(cand[i].path, cand[i].key);
                 filled = i + 1;
