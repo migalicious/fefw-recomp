@@ -203,6 +203,13 @@ Monitor& mon() {
     return *s;
 }
 
+double process_cpu_seconds() {
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0;
+    auto sec = [](const FILETIME& f) { return (double)(((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime) * 1e-7; };
+    return sec(k) + sec(u);
+}
+
 void monitor_run(double summary_s) {
     Monitor& s = mon();
     log_set_thread_name("hitch");
@@ -212,6 +219,10 @@ void monitor_run(double summary_s) {
     auto last_line = Clock::now() - std::chrono::seconds(10);
     uint64_t last_n = g_ring_n.load(std::memory_order_acquire);
     bool seen_frames = last_n > 0;
+    double last_ph[kHpCount];
+    for (int i = 0; i < kHpCount; i++) last_ph[i] = hitch_phase_total_ms(i);
+    double last_cpu_s = process_cpu_seconds();
+    auto last_wall = Clock::now();
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(s.m);
@@ -250,6 +261,29 @@ void monitor_run(double summary_s) {
                 const FrameStats st = stats_of(dt);
                 NXLOG_I("hitch", "%llu frames in %.1f s: mean %.1f fps, 1%% low %.1f fps, worst %.1f ms, %zu over 2x the median (%.1f ms)",
                         (unsigned long long)window_frames, st.span_s, st.mean_fps, st.low1_fps, st.worst_ms, st.over2x, st.median_ms);
+                // Where a frame's time went (per-frame averages over the same window). Reading it: a render thread that is mostly
+                // `idle` is waiting for the game (CPU-bound game thread); `gpu_wait`, `acquire`, `limiter` and the game's `backpressure`
+                // and `sync_wait` are waits for the GPU or the display. cpu = process CPU time as cores busy.
+                double ph[kHpCount];
+                for (int i = 0; i < kHpCount; i++) ph[i] = hitch_phase_total_ms(i) - last_ph[i];
+                const double cpu_s = process_cpu_seconds();
+                const auto wnow = Clock::now();
+                const double wall_s = std::chrono::duration<double>(wnow - last_wall).count();
+                const double nf = window_frames > 0 ? (double)window_frames : 1.0;
+                const double period_ms = st.span_s * 1000.0 / (double)st.frames;
+                NXLOG_I("hitch",
+                        "perf: frame %.2f ms; render thread/frame ms: idle %.2f replay %.2f (gpu_wait %.2f submit %.2f upload %.2f pipeline %.2f lock %.2f) present %.2f (limiter %.2f acquire %.2f end %.2f); "
+                        "game/frame ms: backpressure %.2f sync_wait %.2f syscalls %.2f (ipc %.2f wait %.2f), so guest code ~%.2f; "
+                        "any thread/frame ms: faults %.2f ww_arm %.2f pool_import %.2f; cpu %.2f cores",
+                        period_ms, ph[kHpRenderIdle] / nf, ph[kHpRenderReplay] / nf, ph[kHpRenderGpuWait] / nf, ph[kHpRenderSubmit] / nf,
+                        ph[kHpRenderUpload] / nf, ph[kHpRenderPipeline] / nf, ph[kHpRenderLockWait] / nf, ph[kHpRenderPresent] / nf,
+                        ph[kHpRenderLimiter] / nf, ph[kHpRenderAcquire] / nf, ph[kHpRenderPresentEnd] / nf, ph[kHpGameBackpressure] / nf,
+                        ph[kHpGameSyncWait] / nf, ph[kHpGameSvc] / nf, ph[kHpGameIpc] / nf, ph[kHpGameWait] / nf,
+                        period_ms - ph[kHpGameSvc] / nf - ph[kHpGameBackpressure] / nf, ph[kHpFaults] / nf, ph[kHpWwArm] / nf,
+                        ph[kHpPoolImport] / nf, wall_s > 0 ? (cpu_s - last_cpu_s) / wall_s : 0.0);
+                for (int i = 0; i < kHpCount; i++) last_ph[i] += ph[i];
+                last_cpu_s = cpu_s;
+                last_wall = wnow;
             } else if (seen_frames) {
                 NXLOG_W("hitch", "no frame presented in the last %.1f s", summary_s);
             }

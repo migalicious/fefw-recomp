@@ -16,6 +16,7 @@
 
 #include "nxrt/config.h"
 #include "nxrt/frame_limiter.h"
+#include "nxrt/gauge.h"
 #include "nxrt/gfx.h"
 #include "nxrt/log.h"
 #include "nxrt/platform.h"
@@ -108,6 +109,8 @@ struct State {
     double win_game_fps = 0, win_shown_fps = 0;
     bool win_measured = false;
     uint64_t status_ns = 0;                         // the last publish_status (250 ms throttle)
+    uint64_t fg_retry_ns = 0;                       // set_mode: no new request for generation before this time (after a failure)
+    uint32_t fg_fails = 0;                          // failures of slDLSSGSetOptions in a row
 };
 State& st() {
     static State s;
@@ -366,8 +369,17 @@ void set_mode(State& s, bool on, bool release) {
         return;
     }
     if (!streamline_ok(static_cast<int>(r), "slDLSSGSetOptions")) {   // turning it off under eWarnOutOfVRAM is not a failure
-        NXLOG_E(kTag, "slDLSSGSetOptions failed (%d): frame generation off", static_cast<int>(r));
-        s.fg = false;
+        // Not final: generation stays off for a pause that doubles each time, up to 30 s, then is asked for again; after 10 failures in a
+        // row it stays off. (The video memory warning is not a failure, see streamline_ok, and is handled by shed.)
+        ++s.fg_fails;
+        const uint64_t wait_ms = std::min<uint64_t>(2000ull << std::min<uint32_t>(s.fg_fails - 1, 4u), 30000ull);
+        s.fg_retry_ns = FrameLimiter::now_ns() + wait_ms * 1000000ull;
+        if (s.fg_fails >= 10) {
+            NXLOG_E(kTag, "slDLSSGSetOptions failed (%d): frame generation off for good (%u failures in a row)", static_cast<int>(r), s.fg_fails);
+            s.fg = false;
+        } else {
+            NXLOG_E(kTag, "slDLSSGSetOptions failed (%d): frame generation off, trying again in %.0f s", static_cast<int>(r), static_cast<double>(wait_ms) * 1e-3);
+        }
         s.on = false;
         clear_shown_ratio();
         return;
@@ -375,6 +387,7 @@ void set_mode(State& s, bool on, bool release) {
     if (on != s.on) NXLOG_I(kTag, "frame generation %s at frame %u", on ? "on" : "off", s.index);
     if (on && !s.on) s.on_since_ms = GetTickCount64();
     s.on = on;
+    s.fg_fails = 0;
 }
 
 void report(State& s) {
@@ -397,6 +410,16 @@ void report(State& s) {
     }
     NXLOG_I(kTag, "%.1f game fps, %.1f shown fps, generation on %u of %u frames, status %u, last API error %d, Reflex sim start -> GPU end %.2f ms, GPU frame %.2f ms (%d frames)",
             s.n_game / sec, s.n_shown / sec, s.n_on, s.n_game, s.status, g_api_error.load(), n ? lat / n * 1e-3 : 0.0, n ? gpu / n * 1e-3 : 0.0, n);
+    {
+        // Per game frame averages of the same time breakdown the "hitch" perf line prints, over this window (see gauge.h HitchPhase).
+        static double last[kHpCount];
+        double d[kHpCount];
+        for (int i = 0; i < kHpCount; i++) { const double v = hitch_phase_total_ms(i); d[i] = v - last[i]; last[i] = v; }
+        const double nf = s.n_game > 0 ? static_cast<double>(s.n_game) : 1.0;
+        NXLOG_I(kTag, "time per game frame ms: render idle %.2f, replay %.2f (gpu_wait %.2f, upload %.2f), limiter %.2f, acquire %.2f; game backpressure %.2f, sync_wait %.2f, syscalls %.2f",
+                d[kHpRenderIdle] / nf, d[kHpRenderReplay] / nf, d[kHpRenderGpuWait] / nf, d[kHpRenderUpload] / nf, d[kHpRenderLimiter] / nf,
+                d[kHpRenderAcquire] / nf, d[kHpGameBackpressure] / nf, d[kHpGameSyncWait] / nf, d[kHpGameSvc] / nf);
+    }
     set_shown_ratio(s.n_game, s.n_shown, s.n_on);
     s.win_shown = s.n_shown;
     s.win_game = s.n_game;
@@ -639,7 +662,7 @@ void framegen_present_begin(VkCommandBuffer cb, VkExtent2D backbuffer, VkExtent2
                               : unfocused ? render_status::Pause::Unfocused
                               : render_status::Pause::NoInputs;
         s.streak = want ? s.streak + 1 : 0;
-        const bool on = want && s.streak >= 2;
+        const bool on = want && s.streak >= 2 && FrameLimiter::now_ns() >= s.fg_retry_ns;
         const bool moved = backbuffer.width != s.bb.width || backbuffer.height != s.bb.height || !std::equal(rect, rect + 4, s.rect);
         if (moved && s.on) set_mode(s, false);
         s.bb = backbuffer;

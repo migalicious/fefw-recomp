@@ -74,6 +74,23 @@ void rotate_previous(const std::string& path) {
     std::FILE* old = std::fopen(path.c_str(), "rb");
     if (!old) return;
     std::fclose(old);
+    // Keep every run: copy the old log to log_history\<name>-<time of its last write>.log beside it (runs under 64 KB are not worth keeping).
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa) && fa.nFileSizeHigh == 0 && fa.nFileSizeLow >= 65536) {
+            FILETIME lt{};
+            SYSTEMTIME st{};
+            if (FileTimeToLocalFileTime(&fa.ftLastWriteTime, &lt) && FileTimeToSystemTime(&lt, &st)) {
+                const size_t slash = path.find_last_of("\/");
+                const std::string dir = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "log_history";
+                const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+                char stamp[40];
+                std::snprintf(stamp, sizeof stamp, "-%04d%02d%02d-%02d%02d%02d.log", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+                CreateDirectoryA(dir.c_str(), nullptr);
+                CopyFileA(path.c_str(), (dir + "\\" + base + stamp).c_str(), TRUE);
+            }
+        }
+    }
     std::string prev = path + ".prev";
     std::remove(prev.c_str());
     std::rename(path.c_str(), prev.c_str());

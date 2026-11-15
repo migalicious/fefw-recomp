@@ -8,8 +8,10 @@
 // Choosing DLSS later in the F1 page takes effect at the next start.
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -140,7 +142,15 @@ public:
 
     bool evaluate(VkCommandBuffer cb, const TemporalFrame& f) override {
         Sl& s = sl_state();
-        if (failed_) return false;
+        if (failed_) {
+            // A failure is not final (the caller shows the built-in upscaler meanwhile): DLSS is tried again after a pause that doubles each
+            // time, up to 30 s, and for good after kMaxFails in a row. The video memory warning (eWarnOutOfVRAM) is not a failure, see above.
+            if (fails_ >= kMaxFails || now_ms() < retry_at_ms_) return false;
+            NXLOG_I(kTag, "%s: trying again (failure %u of %u)", name(), fails_, kMaxFails);
+            failed_ = false;
+            recovering_ = true;
+            last_mode_ = sl::DLSSMode::eCount;   // the mode and output size are set again, and the history starts over (reset below)
+        }
         // DLSS-G consumes viewport 0 at present; keep SR tags/constants separate.
         const sl::ViewportHandle vp(framegen_dlss() ? 1u : 0u);
         sl::FrameToken* frame = static_cast<sl::FrameToken*>(sl_frame_token());
@@ -204,7 +214,7 @@ public:
         c.depthInverted = sl::Boolean::eTrue;
         c.cameraMotionIncluded = sl::Boolean::eTrue;
         c.motionVectors3D = sl::Boolean::eFalse;
-        c.reset = f.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        c.reset = f.reset || recovering_ ? sl::Boolean::eTrue : sl::Boolean::eFalse;
         c.motionVectorsJittered = sl::Boolean::eFalse;
         if (s.constants(c, *frame, vp) != sl::Result::eOk) return fail("slSetConstants");
         sl::Resource col = resource(f.color), dep = resource(f.depth), mv = resource(f.motion), out = resource(f.output);
@@ -222,9 +232,13 @@ public:
         if (er == sl::Result::eWarnOutOfVRAM && vram_fallback_due()) {
             NXLOG_E(kTag, "the video memory budget stayed used up for %u s with frame generation off and the driver refused allocations: DLSS off", kWarnPersistMs / 1000);
             failed_ = true;   // from the next frame on; this one was evaluated
-        } else if (er != sl::Result::eWarnOutOfVRAM) {
+            retry_at_ms_ = now_ms() + 30000;   // not counted as a failure in a row: tried again, and given up again if the shortage lasts
             warn_since_ms_ = 0;
+            return true;
         }
+        if (er != sl::Result::eWarnOutOfVRAM) warn_since_ms_ = 0;
+        fails_ = 0;
+        recovering_ = false;
         return true;
     }
 
@@ -266,13 +280,25 @@ private:
     }
     static constexpr float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     bool fail(const char* what, int code = -1) {
-        NXLOG_E(kTag, "%s failed (%d): DLSS off", what, code);
+        ++fails_;
+        const uint64_t wait_ms = std::min<uint64_t>(2000ull << std::min<uint32_t>(fails_ - 1, 4u), 30000ull);
+        if (fails_ >= kMaxFails) NXLOG_E(kTag, "%s failed (%d): DLSS off for good (%u failures in a row)", what, code, fails_);
+        else NXLOG_E(kTag, "%s failed (%d): DLSS off, the built-in upscaler is used; trying again in %.0f s", what, code, static_cast<double>(wait_ms) * 1e-3);
         // The F1 page shows this beside the fallback: Streamline's own wording, not a guess about the DLLs.
         if (code >= 0) std::snprintf(failure_, sizeof(failure_), "%s failed (%d): DLSS off", what, code);
         else std::snprintf(failure_, sizeof(failure_), "%s failed: DLSS off", what);
         failed_ = true;
+        recovering_ = false;
+        retry_at_ms_ = now_ms() + wait_ms;
         return false;
     }
+    static uint64_t now_ms() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    static constexpr uint32_t kMaxFails = 10;
+    uint32_t fails_ = 0;
+    uint64_t retry_at_ms_ = 0;
+    bool recovering_ = false;
     // After an evaluation that returned eWarnOutOfVRAM: whether DLSS should give way to the built-in upscaler. Frame generation sheds its
     // memory first (framegen.cpp), so the warnings only count while it is not generating; and the warning alone is not harm (Streamline
     // keeps reporting it on a card that runs at its budget with nothing failing), so the driver must also have refused an allocation
