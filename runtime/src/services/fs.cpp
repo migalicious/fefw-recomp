@@ -37,6 +37,40 @@ namespace nxrt::services {
 
 namespace {
 
+// Scene markers for the log: the game opens its map files when a scene loads (Map/Hub/Hub_002 = a town, Map/Btl/Btl_004 = a battle map,
+// Map/Dng, Map/Gmp, Map/Bqt, and the Script/<kind> folder), so a change of the map or script folder is logged once as "scene: ...". The log's
+// timestamps line it up with the "perf:" lines. It only looks at the path of a successful OpenFile.
+void note_scene_file(const std::string& path) {
+    static std::mutex mu;
+    static std::string last_map, last_script;
+    auto seg = [&](size_t from, size_t* end) {
+        while (from < path.size() && (path[from] == '/' || path[from] == '\\')) from++;
+        size_t e = from;
+        while (e < path.size() && path[e] != '/' && path[e] != '\\') e++;
+        *end = e;
+        return path.substr(from, e - from);
+    };
+    size_t e = 0;
+    const std::string top = seg(0, &e);
+    std::string key;
+    bool is_map = false;
+    if (top == "Map") {
+        const std::string kind = seg(e, &e);
+        if (kind != "Hub" && kind != "Btl" && kind != "Dng" && kind != "Gmp" && kind != "Bqt") return;
+        key = kind + "/" + seg(e, &e);
+        is_map = true;
+    } else if (top == "Script") {
+        key = "Script/" + seg(e, &e);
+    } else {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    std::string& last = is_map ? last_map : last_script;
+    if (last == key) return;
+    last = key;
+    NXLOG_I("fs", "scene: %s %s (opened %s)", is_map ? "map" : "script", key.c_str(), path.c_str());
+}
+
 using ipc::Request;
 using ipc::Response;
 using ipc::Service;
@@ -344,6 +378,7 @@ std::shared_ptr<Service> make_filesystem(std::shared_ptr<Volume> v, std::string 
             std::shared_ptr<fs::VFile> f;
             const uint32_t r = v->open_file(p, req.arg<uint32_t>(0), &f);
             diag_note_file("open", (label + p).c_str());
+            if (!r) note_scene_file(p);
             if (r) {
                 NXLOG_D("fs", "OpenFile %s%s (mode %u) -> 0x%x", label.c_str(), p.c_str(), req.arg<uint32_t>(0), r);
                 return r;
