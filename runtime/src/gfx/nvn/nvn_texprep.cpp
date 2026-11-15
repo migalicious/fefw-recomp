@@ -60,6 +60,7 @@ struct State {
     uint64_t budget = 0;
     uint64_t min_bytes = 0;                  // smaller textures are prepared inline: the hand-over costs more than the work
     uint64_t stage_bytes = 0;                // results from this size are copied into an upload buffer by the job (0: never)
+    int64_t wait_ms = 2;                     // maximum wait at each render-thread hand-over
     std::atomic<bool> quiesced{false};       // the GPU layer is shutting down: no more upload buffers
     uint64_t early_bytes = 0;                // textures from this size are also prepared when they are registered in a texture pool (the others only when bound)
     bool verify = false;
@@ -71,9 +72,11 @@ struct State {
 
 std::atomic<uint64_t> s_transcoded{0};   // ASTC -> BC7 transcodes made by jobs (no cache entry)
 std::atomic<uint64_t> s_provisional{0};  // quick stand-ins the render thread uploaded while a job made the real data
+std::atomic<uint64_t> s_wait_timeouts{0};
 // the hitch log: transcodes the jobs finished and stand-ins uploaded during a slow frame
 const bool g_hitch_tc_registered = (nxrt::hitch_add_counter("texprep_transcodes", []() -> uint64_t { return s_transcoded.load(std::memory_order_relaxed); }),
-                                    nxrt::hitch_add_counter("texture_standins", []() -> uint64_t { return s_provisional.load(std::memory_order_relaxed); }), true);
+                                    nxrt::hitch_add_counter("texture_standins", []() -> uint64_t { return s_provisional.load(std::memory_order_relaxed); }),
+                                    nxrt::hitch_add_counter("texprep_wait_timeouts", []() -> uint64_t { return s_wait_timeouts.load(std::memory_order_relaxed); }), true);
 
 State* g_state = nullptr;
 std::once_flag g_once;
@@ -140,6 +143,7 @@ void leave_waiting_locked(Texture* t) {
 // Caller holds mu. Queues a job for t unless one is waiting; a running job is asked to run again.
 void schedule_locked(Texture* t) {
     State& s = S();
+    if (s.quiesced.load()) return;
     Entry& e = s.map[t];
     if (e.st == Entry::Queued) return;                // the job reads the generation when it starts
     if (e.st == Entry::Running) { e.again = true; return; }
@@ -178,6 +182,7 @@ void schedule_locked(Texture* t) {
 // Caller holds mu. A write was reported for a sparse texture: the job starts when the writes stop (the game maps and fills the tiles one range at a time).
 void debounce_locked(Texture* t) {
     State& s = S();
+    if (s.quiesced.load()) return;
     Entry& e = s.map[t];
     const uint64_t due = now_ns() + kDebounceNs;
     switch (e.st) {
@@ -199,6 +204,7 @@ void worker_main() {
     State& s = S();
     std::unique_lock<std::mutex> lk(s.mu);
     for (;;) {
+        s.cv_work.wait(lk, [&] { return !s.quiesced.load(); });
         if (!s.waiting.empty()) {                         // Waiting textures whose writes stopped: queue them now
             const uint64_t now = now_ns();
             uint64_t next = UINT64_MAX;
@@ -384,6 +390,7 @@ void init_once() {
         s.min_bytes = static_cast<uint64_t>(std::max<int64_t>(0, config_get_int("nvn", "tex_prep_min_kb", 8))) << 10;
         s.early_bytes = static_cast<uint64_t>(std::max<int64_t>(0, config_get_int("nvn", "tex_prep_early_kb", 1024))) << 10;
         s.stage_bytes = static_cast<uint64_t>(std::max<int64_t>(0, config_get_int("nvn", "tex_prep_stage_kb", 1024))) << 10;
+        s.wait_ms = std::clamp<int64_t>(config_get_int("nvn", "tex_prep_wait_ms", 2), 0, 5000);
         s.verify = config_get_bool("nvn", "tex_prep_verify", false);
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
         int n = static_cast<int>(config_get_int("nvn", "tex_prep_threads", 0));
@@ -391,8 +398,8 @@ void init_once() {
         for (int i = 0; i < n; ++i) std::thread(worker_main).detach();
         g_enabled.store(1);
         g_tex_prep_on.store(true);
-        NXLOG_I(kTag, "background texture preparation: %d threads, budget %llu MB, textures from %llu KB%s", n, static_cast<unsigned long long>(s.budget >> 20),
-                static_cast<unsigned long long>(s.min_bytes >> 10), s.verify ? ", verifying every result" : "");
+        NXLOG_I(kTag, "background texture preparation: %d threads, budget %llu MB, textures from %llu KB, wait limit %lld ms%s", n, static_cast<unsigned long long>(s.budget >> 20),
+                static_cast<unsigned long long>(s.min_bytes >> 10), static_cast<long long>(s.wait_ms), s.verify ? ", verifying every result" : "");
     });
 }
 
@@ -407,7 +414,12 @@ bool eligible(const Texture* t) {
 }
 
 void consider(Texture* t) {
+    std::lock_guard<std::mutex> lk(S().mu);
+    if (S().quiesced.load()) return;
     if (!eligible(t) || !gpu::active()) return;
+    const uint32_t mark = t->prep_gen.load(std::memory_order_acquire) | 0x80000000u;
+    if (t->prep_sched.load(std::memory_order_relaxed) == mark) return;
+    t->prep_sched.store(mark, std::memory_order_relaxed);
     if (!S().caps_ready.load(std::memory_order_acquire)) {
         static std::mutex cm;
         std::lock_guard<std::mutex> cl(cm);
@@ -423,7 +435,6 @@ void consider(Texture* t) {
             S().caps_ready.store(true, std::memory_order_release);
         }
     }
-    std::lock_guard<std::mutex> lk(S().mu);
     schedule_locked(t);
 }
 
@@ -463,13 +474,11 @@ void on_registered(Texture* t) {
 
 void on_bound(Texture* t) {
     if (!t || !enabled()) return;
-    if (S().quiesced.load(std::memory_order_relaxed)) reopen_staging();      // a new GPU layer is running (the old one was shut down)
+    if (S().quiesced.load(std::memory_order_relaxed)) return;
     if (!(t->prep_flags.load(std::memory_order_relaxed) & kWanted)) t->prep_flags.fetch_or(kWanted, std::memory_order_acq_rel);
     if (!t->cpu_dirty.load(std::memory_order_relaxed)) return;      // the common case: bound again every draw, nothing to do
-    const uint32_t gen = t->prep_gen.load(std::memory_order_acquire);
-    const uint32_t mark = gen | 0x80000000u;
-    if (t->prep_sched.load(std::memory_order_relaxed) == mark) return;                    // already requested for this content
-    t->prep_sched.store(mark, std::memory_order_relaxed);
+    const uint32_t mark = t->prep_gen.load(std::memory_order_acquire) | 0x80000000u;
+    if (t->prep_sched.load(std::memory_order_relaxed) == mark) return;   // consider rechecks under the lifecycle lock
     consider(t);
 }
 
@@ -481,14 +490,17 @@ bool peek_entry_format(Texture* t, VkFormat& entry) {
     if (!enabled() || !t) return false;
     State& s = S();
     std::unique_lock<std::mutex> lk(s.mu);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(s.wait_ms);
     for (;;) {
         auto it = s.map.find(t);
         if (it == s.map.end()) return false;
         Entry& e = it->second;
         if (e.st == Entry::Running && e.job_gen == t->prep_gen.load(std::memory_order_acquire)) {
             if (e.slow) return false;   // no cache entry: the job transcodes (seconds); the caller looks the texture up itself, as with no job
-            if (s.cv_done.wait_until(lk, deadline) == std::cv_status::timeout) return false;
+            if (s.cv_done.wait_until(lk, deadline) == std::cv_status::timeout) {
+                s_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
             continue;
         }
         if (e.st != Entry::Done || e.job_gen != t->prep_gen.load(std::memory_order_acquire) || !e.res) return false;
@@ -503,7 +515,7 @@ bool take(Texture* t, PreparedTexture& out, gfx::Buffer* staged, uint64_t* src_h
     const uint64_t t_enter = now_ns();
     std::unique_lock<std::mutex> lk(s.mu);
     bool waited = false;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(s.wait_ms);
     for (;;) {
         auto it = s.map.find(t);
         if (it == s.map.end()) {
@@ -540,7 +552,10 @@ bool take(Texture* t, PreparedTexture& out, gfx::Buffer* staged, uint64_t* src_h
             const uint64_t tw = nxrt::hitch_ticks();
             const bool timed_out = s.cv_done.wait_until(lk, deadline) == std::cv_status::timeout;
             if (nxrt::hitch_on_render_thread()) nxrt::hitch_phase_add(nxrt::kHpRenderLockWait, nxrt::hitch_ticks() - tw);
-            if (timed_out) return false;
+            if (timed_out) {
+                s_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
             continue;
         }
         // Done: usable when nothing was written since (generation) and the storage still holds the bytes the job read (content hash)
@@ -651,32 +666,35 @@ void release_staging() {
     if (!g_state) return;
     State& s = S();
     std::vector<Ref<Texture>> release;
+    std::deque<Job> cancelled;
     {
         std::unique_lock<std::mutex> lk(s.mu);
         s.quiesced.store(true);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        cancelled.swap(s.q);
+        s.waiting.clear();
         for (;;) {
             bool busy = false;
             for (const auto& kv : s.map)
                 if (kv.second.st == Entry::Running) busy = true;
             if (!busy) break;
-            if (s.cv_done.wait_until(lk, deadline) == std::cv_status::timeout) break;
+            s.cv_done.wait(lk);   // device-dependent work must finish before its device is destroyed
         }
         for (auto it = s.map.begin(); it != s.map.end();) {
-            if (it->second.stage && it->second.st == Entry::Done) {
-                drop_result(it->second);           // gives the upload buffer back
-                release.push_back(std::move(it->second.keep));
-                it = s.map.erase(it);
-            } else {
-                ++it;
-            }
+            it->first->prep_sched.store(0, std::memory_order_relaxed);
+            drop_result(it->second);
+            release.push_back(std::move(it->second.keep));
+            it = s.map.erase(it);
         }
+        s.caps_ready.store(false, std::memory_order_release);
     }
     release.clear();
 }
 
 void reopen_staging() {
-    if (g_state) S().quiesced.store(false);
+    if (!g_state) return;
+    std::lock_guard<std::mutex> lk(S().mu);
+    S().quiesced.store(false);
+    S().cv_work.notify_all();
 }
 
 Stats stats() {

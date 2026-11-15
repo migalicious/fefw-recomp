@@ -60,7 +60,8 @@ void provisional_uploaded(Texture* t);
 void final_uploaded(Texture* t);
 // Any thread: hash of the texture's storage as take checks it (false: no storage or a page is gone).
 bool hash_storage(const Texture& t, uint64_t& h);
-// The GPU layer is going away (gpu::tex_shutdown): finished results give their upload buffers back and no new ones are made until reopen_staging.
+// The GPU layer is going away: park workers, cancel queued work and wait for running work before releasing all results.
+// The device must stay alive until this returns. reopen_staging is called only after a new GPU layer is installed.
 void release_staging();
 void reopen_staging();
 

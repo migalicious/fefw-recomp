@@ -1286,6 +1286,22 @@ NXTEST(texprep_background_upload) {
         tp::wait_idle_for_test();
         upload_and_compare(big, "big texture, upload buffer filled by the job");
         CHECK_EQ(tp::stats().hits - s6.hits, 1ull);
+        // Quiesce with a burst in flight: all queued/running work and results
+        // must be gone before GPU teardown, and binding cannot reopen it.
+        for (auto& x : many) {
+            gpu::mark_texture_cpu_dirty(x.t.get());
+            gpu::texture_bound(x.t.get());
+        }
+        tp::release_staging();
+        const auto stopped = tp::stats().scheduled;
+        gpu::mark_texture_cpu_dirty(a.t.get());
+        gpu::texture_bound(a.t.get());
+        CHECK_EQ(tp::stats().scheduled, stopped);
+        tp::reopen_staging();
+        gpu::texture_bound(a.t.get());
+        tp::wait_idle_for_test();
+        CHECK(tp::stats().scheduled > stopped);
+        upload_and_compare(a, "background work resumed after quiescing");
     }
     teardown(r);
 }

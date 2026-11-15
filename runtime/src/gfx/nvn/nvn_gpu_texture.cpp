@@ -2888,8 +2888,8 @@ TexStats tex_stats() {
 // Frees every cached object this module made (samplers, dummy views and images). Render thread, device idle, no texture alive:
 // called by the tests before shutdown_for_test (the back end's teardown does not call it yet).
 void tex_shutdown() {
-    texup::shutdown();                // the cache upgrade threads stop (their work is dropped, never half written)
     texprep::release_staging();       // upload buffers of finished background results belong to the device that is going away
+    texup::shutdown();                // texprep can enqueue upgrades: drain it before stopping the upgrade workers
     astc_gpu_shutdown();              // [gfx] astc_gpu: its pipelines, scratch buffer and queued textures
     std::vector<TexGpu*> left;
     {

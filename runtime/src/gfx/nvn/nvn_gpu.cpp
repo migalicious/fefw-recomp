@@ -37,6 +37,7 @@
 #include "nvn_impl.h"
 #include "nvn_pipeline.h"
 #include "nvn_present_pass.h"
+#include "nvn_texprep.h"
 #include "extras/output_pass.h"
 
 namespace nxrt::nvn::be::gpu {
@@ -1198,6 +1199,7 @@ bool bring_up(gfx::Device& dev, gfx::Renderer* rend, FrameLimiter* limiter, bool
     NXLOG_I(kTag, "NVN back end up on %s (%u submission slots, timeline semaphore, host-memory import %s)", dev.properties().deviceName, kSlots,
             dev.features().external_memory_host ? "available" : "NOT available");
     astc_gpu_start();   // [gfx] astc_gpu: its pipelines and self-test start now, on a thread of their own, so the first texture does not wait for them
+    texprep::reopen_staging();   // only a completed device installation may resume background GPU work
     return true;
 }
 
